@@ -67,6 +67,9 @@
 - 新增两个联网冒烟脚本：`scripts/smoke_live.py`（服务层）与 `scripts/smoke_mcp.py`
   （走 stdio 的真实 MCP 调用）。
 
+> 注意：上游文档里的 `P115_CHECK_FOR_RELOGIN` 已经移除。新版 p115client（0.0.9+）
+> 不再接受 `check_for_relogin` 参数，本 fork 也已删掉这个配置项。
+
 ## 快速开始
 
 如果你想最快跑起来，可以按这个顺序：
@@ -163,7 +166,6 @@ python -m venv .venv
 
 ```env
 P115_COOKIES_PATH=~/115-cookies.txt
-P115_CHECK_FOR_RELOGIN=true
 P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
 ```
@@ -196,7 +198,6 @@ P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
 
 ```env
 P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
-P115_CHECK_FOR_RELOGIN=true
 P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
 FASTMCP_TRANSPORT=stdio
@@ -272,7 +273,6 @@ scripts\run-http.cmd
 
 ```text
 P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
-P115_CHECK_FOR_RELOGIN=true
 P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
 ```

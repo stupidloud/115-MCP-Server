@@ -22,7 +22,6 @@ class Settings(BaseSettings):
 
     p115_cookies: str | None = Field(default=None, alias="P115_COOKIES")
     p115_cookies_path: str | None = Field(default=None, alias="P115_COOKIES_PATH")
-    p115_check_for_relogin: bool = Field(default=True, alias="P115_CHECK_FOR_RELOGIN")
     p115_allow_qrcode_login: bool = Field(default=False, alias="P115_ALLOW_QRCODE_LOGIN")
     p115_console_qrcode: bool = Field(default=False, alias="P115_CONSOLE_QRCODE")
 

@@ -309,7 +309,6 @@ class P115Service:
             "configured": self.settings.has_auth_configuration,
             "cookies_source": self.settings.cookies_source,
             "active_platform": self._active_platform,
-            "check_for_relogin": self.settings.p115_check_for_relogin,
             "allow_qrcode_login": self.settings.p115_allow_qrcode_login,
             "console_qrcode": self.settings.p115_console_qrcode,
             "client_initialized": self._client_instance is not None,
