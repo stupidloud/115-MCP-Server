@@ -8,6 +8,7 @@ from fastmcp import FastMCP
 from fastmcp.resources import ResourceContent, ResourceResult
 
 from .config import Settings
+from .p115_login import DEFAULT_LOGIN_APP
 from .service import P115Service
 
 
@@ -91,6 +92,65 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         and become active for all other tools immediately.
         """
         return bound_service.finish_qrcode_login(session_id=session_id, output_path=output_path)
+
+    @mcp.tool
+    def login_with_password(
+        account: str,
+        password: str,
+        app: str = DEFAULT_LOGIN_APP,
+        code: str = "",
+        code_id: str = "",
+        device_id: str = "",
+    ) -> dict:
+        """Log in to 115 with an account/phone number and password, as a DEVICE.
+
+        The login is always an app ("device") login, never app="web": a web
+        login would sign out your own browser session and is not a device.
+
+        device_id is optional: by default it is derived from the account name by
+        a fixed algorithm, so one account always logs in as the same device. A
+        device that is not in the trust list yet triggers the two-step SMS code;
+        add it to the trust list in the 115 app to skip that.
+
+        Returns one of three stages:
+          - "done": logged in; cookies were saved to P115_COOKIES_PATH and are
+            active for every other tool immediately.
+          - "captcha": a picture captcha is required. Call get_login_captcha,
+            read the image, then retry with code + code_id.
+          - "sms": the account has two-step verification; an SMS code was just
+            sent, finish with submit_login_sms(account, code, app=...).
+
+        Note: logging in as a device will sign out other sessions of that device.
+        """
+        return bound_service.login_with_password(
+            account,
+            password,
+            app=app,
+            code=code,
+            code_id=code_id,
+            device_id=device_id,
+        )
+
+    @mcp.tool
+    def get_login_captcha() -> dict:
+        """Fetch a fresh 115 login picture captcha.
+
+        Returns code_id plus two images: target_image (the 4 characters to
+        find) and pool_image (10 candidate characters numbered 0-9, left to
+        right, top to bottom). Build `code` from the positions of the 4 target
+        characters inside the pool, then retry login_with_password with
+        code + code_id.
+        """
+        return bound_service.get_login_captcha()
+
+    @mcp.tool
+    def submit_login_sms(account: str, code: str, app: str = DEFAULT_LOGIN_APP) -> dict:
+        """Finish a two-step-verification login with the SMS code.
+
+        account is the same account/phone used in login_with_password; code is
+        the SMS code just received.
+        """
+        return bound_service.submit_login_sms(account, code, app=app)
 
     @mcp.tool
     def list_directory(

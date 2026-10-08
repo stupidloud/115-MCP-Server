@@ -19,6 +19,7 @@ from p115client import P115Client, check_response
 from p115client.fs import P115FileSystem
 from yarl import URL
 
+from . import p115_login
 from .config import Settings
 from .p115_compat import create_client, create_fs, resolve_client_method, resolve_fs_method
 
@@ -92,6 +93,31 @@ def _is_programming_error(exc: Exception) -> bool:
     return isinstance(exc, _PROGRAMMING_ERRORS) or isinstance(getattr(exc, "__cause__", None), _PROGRAMMING_ERRORS)
 
 
+def _cookies_to_str(cookie: Any) -> str:
+    """115 登录响应里的 cookie 可能是 dict，也可能是 "k=v; k=v" 字符串。"""
+    if isinstance(cookie, str):
+        return cookie
+    if isinstance(cookie, Mapping):
+        return "; ".join(f"{key}={value}" for key, value in cookie.items())
+    return str(cookie)
+
+
+def _image_data_uri(data: Any) -> str:
+    """把图片字节转成 data URI（按文件头判断 MIME）。"""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return ""
+    raw = bytes(data)
+    if raw.startswith(b"\x89PNG"):
+        mime = "image/png"
+    elif raw.startswith(b"\xff\xd8"):
+        mime = "image/jpeg"
+    elif raw.startswith(b"GIF8"):
+        mime = "image/gif"
+    else:
+        mime = "application/octet-stream"
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     """判断异常是不是超时（长轮询没等到状态变化时会出现）。"""
     for current in (exc, exc.__cause__):
@@ -157,6 +183,7 @@ class P115Service:
         self._fs_cache: dict[str | None, P115FileSystem] = {}
         self._active_platform: str | None = None
         self._qrcode_sessions: dict[str, dict[str, Any]] = {}
+        self._captcha_client_instance: P115Client | None = None
         self._cookie_source_signature: tuple[Any, ...] | None = None
         self._state_lock = threading.RLock()
         self._offline_lane_lock = threading.RLock()
@@ -476,7 +503,201 @@ class P115Service:
             check_response,
             P115Client.login_qrcode_scan_result(session["uid"], app=session["app"]),
         )
-        cookies = str(response["data"]["cookie"])
+        with self._state_lock:
+            self._qrcode_sessions.pop(session_id, None)
+        result = self._persist_login_cookies(
+            response["data"]["cookie"],
+            app=session["app"],
+            output_path=output_path,
+        )
+        return {
+            "session_id": session_id,
+            "app": session["app"],
+            "uid": session["uid"],
+            **result,
+            "result": self._normalize(response),
+        }
+
+    # ---------------- 账号 / 手机号 + 密码登录 ----------------
+
+    def _captcha_client(self) -> P115Client:
+        """拿一个只用于请求验证码图片的假客户端（不参与鉴权）。"""
+        with self._state_lock:
+            if self._captcha_client_instance is None:
+                self._captcha_client_instance = create_client(
+                    "UID=1_A1_1; CID=2; SEID=3; KID=4",
+                    app="web",
+                    console_qrcode=False,
+                )
+            return self._captcha_client_instance
+
+    def get_login_captcha(self) -> dict[str, Any]:
+        """获取登录用的图形验证码。
+
+        返回 ``code_id``（重试登录时要带上）和两张图：
+
+        - ``target_image``：要找的 4 个汉字
+        - ``pool_image``：10 个候选汉字，按「从左到右、从上到下」编号 0-9
+
+        把 4 个目标字在候选里的编号按顺序拼成 ``code``，再带
+        ``code`` / ``code_id`` 调用 ``login_with_password`` 重试。
+        """
+        client = self._captcha_client()
+        sign_resp = self._call_backend(check_response, client.captcha_sign())
+        code_id = str(sign_resp.get("sign") or "")
+        target = self._call_backend(client.captcha_code)
+        pool = self._call_backend(client.captcha_all)
+        result: dict[str, Any] = {
+            "code_id": code_id,
+            "how_to": (
+                "target_image 里是要找的 4 个汉字；pool_image 里是 10 个候选汉字，"
+                "按从左到右、从上到下编号 0-9。把 4 个目标字在候选里的编号按顺序拼成 "
+                "code，然后带 code 和 code_id 重新调用 login_with_password。"
+            ),
+        }
+        target_uri = _image_data_uri(target)
+        pool_uri = _image_data_uri(pool)
+        if target_uri:
+            result["target_image"] = target_uri
+        if pool_uri:
+            result["pool_image"] = pool_uri
+        return result
+
+    def login_with_password(
+        self,
+        account: str,
+        password: str,
+        *,
+        app: str = p115_login.DEFAULT_LOGIN_APP,
+        code: str = "",
+        code_id: str = "",
+        device_id: str = "",
+    ) -> dict[str, Any]:
+        """用账号（或手机号）+ 密码，以**设备（app）方式**登录。
+
+        登录的是一台「设备」（``app="android"`` → 115 安卓端，``F1`` 会话），
+        不是 ``app="web"``：web 方式会顶掉浏览器端的登录，而且 web 不算设备。
+
+        ``device_id`` 默认由账号名按固定算法推出（同一个账号永远是同一台设备，
+        见 ``p115_login.derive_device_id``）；显式传 ``device_id`` 可以改用别的设备。
+
+        可能返回三个阶段：
+
+        - ``stage="done"``：登录成功，cookies 已写回 ``P115_COOKIES_PATH``
+        - ``stage="captcha"``：需要图形验证码。先调 ``get_login_captcha``，识别后带
+          ``code`` / ``code_id`` 重试
+        - ``stage="sms"``：账号开了两步验证，已发送短信验证码，改用
+          ``submit_login_sms(account, code, app=...)`` 完成（``app`` 要与这里一致）
+        """
+        if not account.strip():
+            raise ToolError("account must not be empty.")
+        if not password:
+            raise ToolError("password must not be empty.")
+        app = self._resolve_login_app(app)
+        device_id = device_id.strip() or p115_login.derive_device_id(account)
+
+        response = self._call_backend(
+            p115_login.submit_password,
+            app=app,
+            account=account.strip(),
+            password=password,
+            device_id=device_id,
+            code=code.strip(),
+            code_id=code_id.strip(),
+        )
+        errno = response.get("errno")
+        error = response.get("error") or response.get("message")
+        cookies = self._extract_login_cookies(response)
+        if cookies is not None:
+            return {"stage": "done", **self._persist_login_cookies(cookies, app=app), "result": self._normalize(response)}
+
+        if errno == p115_login.ERRNO_TWO_STEP:
+            user_id = (response.get("data") or {}).get("user_id")
+            sms: dict[str, Any] = {}
+            if user_id:
+                sms = self._call_backend(p115_login.send_login_sms, user_id, app=app)
+            return {
+                "ok": False,
+                "stage": "sms",
+                "errno": errno,
+                "error": error,
+                "user_id": user_id,
+                "sms_sent": bool(sms.get("state")),
+                "hint": "账号开了两步验证，已发送短信验证码。拿到验证码后调用 submit_login_sms(account, code)。",
+            }
+
+        if p115_login.needs_captcha(response):
+            return {
+                "ok": False,
+                "stage": "captcha",
+                "errno": errno,
+                "error": error,
+                "hint": "需要图形验证码：先调用 get_login_captcha() 拿到 code_id 和图片，识别出 code 后重试。",
+            }
+
+        return {"ok": False, "stage": "error", "errno": errno, "error": error}
+
+    def submit_login_sms(
+        self,
+        account: str,
+        code: str,
+        *,
+        app: str = p115_login.DEFAULT_LOGIN_APP,
+    ) -> dict[str, Any]:
+        """两步验证：提交短信验证码，成功后同样会写回 cookies。
+
+        ``app`` 要和上一步 ``login_with_password`` 用的一致，否则拿到的会是另一台设备的会话。
+        """
+        app = self._resolve_login_app(app)
+        if not account.strip():
+            raise ToolError("account must not be empty.")
+        if not code.strip():
+            raise ToolError("code must not be empty.")
+        response = self._call_backend(
+            p115_login.submit_login_sms_code,
+            account=account.strip(),
+            code=code.strip(),
+            app=app,
+        )
+        cookies = self._extract_login_cookies(response)
+        if cookies is not None:
+            return {"stage": "done", **self._persist_login_cookies(cookies, app=app), "result": self._normalize(response)}
+        return {
+            "ok": False,
+            "stage": "error",
+            "errno": response.get("errno"),
+            "error": response.get("error") or response.get("message"),
+        }
+
+    @staticmethod
+    def _resolve_login_app(app: str) -> str:
+        """登录只走设备（app）方式；``web`` 会被拒绝。"""
+        try:
+            return p115_login.resolve_login_app(app)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+
+    @staticmethod
+    def _extract_login_cookies(response: Mapping[str, Any]) -> Any:
+        """从登录响应里取出 cookies；取不到就说明没登录成功。"""
+        data = response.get("data")
+        if isinstance(data, Mapping):
+            for key in ("cookie", "cookies"):
+                if data.get(key):
+                    return data[key]
+        if response.get("state") and isinstance(response.get("cookie"), (str, Mapping)):
+            return response["cookie"]
+        return None
+
+    def _persist_login_cookies(
+        self,
+        cookies: Any,
+        *,
+        app: str = "",
+        output_path: str = "",
+    ) -> dict[str, Any]:
+        """把登录拿到的 cookies 写回文件，并让后续工具立刻可用。"""
+        cookie_str = _cookies_to_str(cookies)
 
         destination: Path | None = None
         if output_path.strip():
@@ -486,31 +707,25 @@ class P115Service:
         saved_to = ""
         if destination is not None:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(cookies, encoding="utf-8")
+            destination.write_text(cookie_str, encoding="utf-8")
             saved_to = str(destination)
 
-        # 让后续工具立刻用上新 cookies；用文件路径（Path）传，p115client 才会当成
-        # cookies 文件去读，而不是把路径字符串当作 cookies 解析。
-        cookies_source: str | Path = destination if destination is not None else cookies
-        preferred_platform = session["app"] or None
+        # 用文件路径（Path）传，p115client 才会当成 cookies 文件去读，
+        # 而不是把路径字符串当作 cookies 解析。
+        cookies_source: str | Path = destination if destination is not None else cookie_str
         self._reset_client_state()
         self._cookie_source_signature = None
         logged_in = bool(self._with_client_fallback(
-            "activate_qrcode_cookies",
+            "activate_login_cookies",
             lambda client, _platform: self._call_backend(client.login_status),
-            preferred_platform=preferred_platform,
+            preferred_platform=app or None,
             cookies_source=cookies_source,
         ))
-        with self._state_lock:
-            self._qrcode_sessions.pop(session_id, None)
         return {
-            "session_id": session_id,
-            "app": session["app"],
-            "uid": session["uid"],
+            "ok": logged_in,
             "logged_in": logged_in,
-            "cookies": cookies,
+            "cookies": cookie_str,
             "saved_to": saved_to,
-            "result": self._normalize(response),
         }
 
     def list_directory(
@@ -1618,6 +1833,7 @@ class P115Service:
             self._client_cache.clear()
             self._fs_cache.clear()
             self._active_platform = None
+            self._captcha_client_instance = None
 
     def _ensure_fresh_cookie_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
         with self._state_lock:

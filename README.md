@@ -48,6 +48,31 @@
 
 ### 3. 登录支持增强
 
+#### 3.1 新增账号 / 手机号 + 密码登录（设备方式）
+
+新增 `src/mcp_115_server/p115_login.py` 和三个工具：
+
+- `login_with_password(account, password, app, code, code_id, device_id)`
+- `get_login_captcha()`
+- `submit_login_sms(account, code, app)`
+
+**登录一律走「设备（app）方式」**，默认登录成 115 安卓端（`app="android"`，`F1` 会话），
+**不接受 `app="web"`**：web 方式会把你浏览器端的登录顶掉，而且 web 不算一台设备。
+
+`device_id` 由账号名按**固定算法**推出（UUIDv5，见 `p115_login.derive_device_id`），
+所以不需要存储、也不需要你准备：同一个账号永远登录成同一台设备，
+不会每次都被 115 当成新设备。想改用别的设备，可以在调用时显式传 `device_id=`。
+
+之所以没有直接用 p115client 的 `login_with_password`：那个高层函数一旦碰到
+「已开启两步验证」，就会 `input("请输入短信验证码: ")` **阻塞在终端上**，
+放进 MCP 服务器里会把进程卡死。所以按它的实现拆成了可分步调用的版本
+（密码密文仍然是 115 要求的 `base64(RSA(sha1(password)_时间戳))`，用 `p115cipher` 算）。
+
+图形验证码走 `captcha_sign` + `captcha_code` + `captcha_all`：返回 `code_id`
+和两张图（4 个目标汉字、10 个带编号的候选汉字），调用方把编号拼成 `code` 再重试。
+
+#### 3.2 扫码登录的三个工具增强
+
 三个登录工具（`start_qrcode_login` / `get_qrcode_login_status` / `finish_qrcode_login`）现在：
 
 - `start_qrcode_login` 除了 `qrcode_url`，还返回两种可直接展示的二维码：
@@ -63,6 +88,9 @@
   同时关闭 urllib3 的自动重试（否则实际耗时是 timeout 的 4 倍）。
 - `finish_qrcode_login` 默认把 cookies **写回 `P115_COOKIES_PATH`**（可用
   `output_path` 覆盖），并立即生效，后续工具无需重启即可使用。
+- 顺带修了一个 cookie 格式问题：115 登录响应里的 `data.cookie` 可能是 dict 也可能
+  是字符串，原来直接 `str()` 会把 dict 写成 Python repr，导致写回的 cookies 文件
+  根本无法解析。现在统一用 `_cookies_to_str()` 处理成 `k=v; k=v`。
 
 ### 4. 依赖与测试
 
@@ -116,7 +144,13 @@ uv run 115-MCP-Server
 - 标签列表与标签设置
 - 分享列表、分享详情、接收码、接收分享、分享下载链接、访问用户、分享下载配额
 - 查询账号信息与索引首页统计
-- 支持通过 MCP 发起二维码登录并保存 cookies
+- 通过 MCP 登录并保存 cookies
+  - 扫码登录：`start_qrcode_login` / `get_qrcode_login_status` / `finish_qrcode_login`
+    （二维码同时以 PNG 和纯文本 ASCII 两种形式返回）
+  - 账号密码登录（**设备方式**，默认 `app="android"`）：`login_with_password` /
+    `get_login_captcha` / `submit_login_sms`
+    （支持图形验证码和两步验证短信；`device_id` 由账号名按固定算法推出）
+  - 设备与信任列表：**本服务不做任何查询或维护**（`device_id` 由账号名按固定算法推出）
 
 ## 安装
 
@@ -417,14 +451,82 @@ http://127.0.0.1:8000/mcp
    - `search_entries`
    - `offline_add_urls`
 
-### 常见使用流程 2：没有 cookies，先扫码登录
+### 常见使用流程 2：没有 cookies，先登录
+
+两条路都行，**扫码更稳**（密码登录在网页端常要过验证码，也更容易触发风控）。
+
+#### 方式 A：扫码登录（推荐）
 
 1. 启动服务
-2. 调用 `start_qrcode_login`
-3. 打开返回的 `qrcode_url` 并扫码
-4. 调用 `get_qrcode_login_status` 轮询状态
-5. 状态变成 `signed_in` 后，调用 `finish_qrcode_login`
-6. 保存返回的 cookies，后续直接复用
+2. 调用 `start_qrcode_login`，拿到 `qrcode_url` / `qrcode_image` / `qrcode_ascii`
+3. 用 115 App 扫二维码（客户端能显示图片就用 `qrcode_image`，只能显示文字就把
+   `qrcode_ascii` 原样打印出来）
+4. 调用 `get_qrcode_login_status` 轮询，直到 `signed_in`
+5. 调用 `finish_qrcode_login`，cookies 会自动写回 `P115_COOKIES_PATH`
+
+#### 方式 B：账号 / 手机号 + 密码登录（以「设备」身份）
+
+密码登录**一律是设备（app）方式**，默认登录成 115 安卓端（`app="android"`），
+不会用 `app="web"` —— web 方式会把你浏览器端的登录顶掉，而且 web 不算设备。
+
+`device_id` 不用你准备：服务会拿**账号名**按固定算法算出一个 UUID（`UUIDv5`），
+同一个账号永远算出同一个 `device_id`，所以永远是同一台设备，不需要任何存储。
+想改用别的设备（比如一个已经在信任列表里的），调用时显式传 `device_id=` 即可。
+
+1. 调用 `login_with_password(account, password)`，看返回的 `stage`：
+   - `done`：已登录，cookies 已写回 `P115_COOKIES_PATH`
+   - `captcha`：需要图形验证码 → 调用 `get_login_captcha`，返回 `code_id` 和两张图
+     （`target_image` 是要找的 4 个字，`pool_image` 是 10 个候选字，按从左到右、
+     从上到下编号 0-9）。把 4 个目标字的编号按顺序拼成 `code`，再调用
+     `login_with_password(..., code=code, code_id=code_id)` 重试
+   - `sms`：账号开了两步验证，短信已发出 → 调用 `submit_login_sms(account, code)` 完成
+   - `error`：直接返回 115 的错误码和文案
+2. 登录成功后，cookies 会写回 `P115_COOKIES_PATH`，后续工具直接可用
+3. 如果 115 要求短信：说明这个账号还没用自己的推导设备登录过（对 115 来说是新设备）。
+   过一次短信后它就不再是新设备了；想连这次都免掉，可以把这个推导出的 `device_id`
+   在 115 App 的「账号安全 → 两步验证」里加入信任设备，或者调用时用 `device_id=`
+   指定一个已经在信任列表里的设备
+
+> 登录成功后**会把该设备之前的登录顶掉**（同一台设备只保留最近一次登录）。
+
+#### device_id 从哪来
+
+**默认不用你管**：`login_with_password` 会拿**账号名**算出一个 `device_id`：
+
+```python
+derive_device_id(account) = uuid5(DEVICE_ID_NAMESPACE, account.strip().casefold())
+```
+
+也就是 UUIDv5（名字空间 + SHA-1），输出正好是 115 安卓端 `device_id` 的 UUID 形式。
+同一个账号永远算出同一个值，所以不需要存储、也不需要配置 —— 它就是「这台账号的那台设备」。
+
+`DEVICE_ID_NAMESPACE` 是 `p115_login.py` 里的一个固定常量。改它等于换设备
+（115 会把它当成一台新设备，于是要过短信），所以别随手改。
+
+背景知识：`app="web"` 不需要 `device_id`（服务端按 cookie 生成 `cookie_<hash>` 形式的值）；
+其它 `app` 需要一个**设备标识**。想用别的设备时，调用 `login_with_password` 时传
+`device_id=` 即可，比如：
+
+1. **复用已有设备**——用 115 App / 网页端的「登录设备管理」看已有设备的 `device_id`，
+   然后在调用时用 `device_id=` 指定它。
+
+2. **用已信任的设备（可跳过短信）**——在 115 App 的「账号安全 → 两步验证」里能看到
+   已信任的设备及其 `device_id`。**用这些 `device_id` 登录不会再被要求短信验证码**：
+
+   ```
+   23078RKD5C / Android 16  device_id=e73daa2a-574c-4446-93a2-e9c41e798a95
+   M2007J1SC / Android 13   device_id=1e5bad9d-cc02-4393-97ef-b3f37aa0341f
+   ```
+
+   反之，用一个**全新的** `device_id` 登录，一定会触发两步验证短信。
+
+> **本服务不碰设备与信任列表**：既不查询、也不新增、也不移除。
+> 原因是：只要有一个有效会话，就能给任意 `device_id` 登记免短信，这等于发放绕过短信的
+> 通行证。所以这类操作请一律在 115 App / 网页端的「账号安全」里做
+> （正常登录一次本身也会把该设备记入信任列表）。
+
+> ⚠️ 无论用哪种方式，**用某个 `device_id` 登录都会顶掉该设备上的旧会话**。
+> 比如用你手机对应的 `device_id` 登录，手机上那台设备就会被挤下线。
 
 ### 常见使用流程 3：离线下载资源到 115
 
