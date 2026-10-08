@@ -101,6 +101,7 @@ class FakeClient:
         self.share_recvcode_payload: str | None = None
         self.share_receive_payload: dict | None = None
         self.share_download_url_payload: tuple[dict, str, bool, str] | None = None
+        self.rename_payload: tuple[int, str] | None = None
         self.fs_mkdir_payload: tuple[dict, int | str] | None = None
         self.fs_mkdir_app_payload: tuple[dict, int | str, str] | None = None
         self.fs_files_payload: dict | None = None
@@ -150,6 +151,10 @@ class FakeClient:
         self.fs_files_app_payload = (payload, app)
         return {"state": True, "data": [{"id": 1, "name": "a", "is_dir": False}, {"id": 2, "name": "b", "is_dir": True}]}
 
+    def fs_rename(self, payload: tuple[int, str], **kwargs) -> dict:
+        self.rename_payload = payload
+        return {"state": True, "data": {str(payload[0]): payload[1]}}
+
     def fs_move(self, payload: list[int], pid: int = 0) -> dict:
         self.move_payload = (payload, pid)
         return {"state": True, "data": {"moved": payload, "pid": pid}}
@@ -168,97 +173,95 @@ class FakeClient:
     def fs_index_info(self, payload: int = 0) -> dict:
         return {"state": True, "data": {"include_space_numbers": payload, "files": 99}}
 
-    def offline_add_urls_open(self, payload: dict) -> dict:
-        if self.fail_offline_open:
-            raise RuntimeError("authorization")
-        self.offline_urls_payload = payload
-        return {"state": True, "data": {"task_ids": [1], "payload": payload}}
+    def request(self, url: str, method: str = "GET", payload=None, **kwargs) -> dict:
+        """模拟 p115client 的 client.request，用于开放平台（/open/offline/*）直连。"""
+        if url.endswith("/open/offline/get_quota_info"):
+            return {"state": True, "data": {"quota": 5, "used": 1}}
+        if url.endswith("/open/offline/add_task_urls"):
+            if self.fail_offline_open:
+                raise RuntimeError("authorization")
+            self.offline_urls_payload = payload
+            return {"state": True, "data": {"task_ids": [1], "payload": payload}}
+        if url.endswith("/open/offline/add_task_bt"):
+            self.offline_torrent_payload = payload
+            return {"state": True, "data": {"created": True, "payload": payload}}
+        if url.endswith("/open/offline/torrent"):
+            return {"state": True, "data": {"files": [{"index": 0, "name": "demo.mkv"}], "payload": payload}}
+        if url.endswith("/open/offline/clear_task"):
+            self.offline_clear_payload = payload
+            return {"state": True, "data": {"cleared": True, "payload": payload}}
+        if url.endswith("/open/offline/del_task"):
+            if self.fail_offline_remove_open:
+                raise RuntimeError("authorization")
+            self.offline_remove_payload = payload
+            info_hash = (payload or {}).get("info_hash", "")
+            self.offline_tasks = [task for task in self.offline_tasks if task.get("info_hash") != info_hash]
+            return {"state": True, "data": {"removed": True}}
+        if url.endswith("/open/offline/get_task_list"):
+            return self._fake_offline_page(payload, legacy=False)
+        raise AssertionError(f"unexpected request url: {url}")
 
-    def offline_torrent_info_open(self, payload: dict) -> dict:
-        return {"state": True, "data": {"files": [{"index": 0, "name": "demo.mkv"}], "payload": payload}}
-
-    def offline_add_torrent_open(self, payload: dict) -> dict:
-        self.offline_torrent_payload = payload
-        return {"state": True, "data": {"created": True, "payload": payload}}
-
-    def offline_list_open(self, payload: int = 1) -> dict:
-        self.offline_list_open_calls += 1
-        self.offline_list_payload = payload
+    def _fake_offline_page(self, payload, *, legacy: bool) -> dict:
+        page = int((payload or {}).get("page", 1)) if isinstance(payload, dict) else int(payload or 1)
+        if legacy:
+            self.offline_list_legacy_calls += 1
+            self.offline_list_legacy_payload = payload
+        else:
+            self.offline_list_open_calls += 1
+            self.offline_list_payload = page
         if self.offline_list_wait_event is not None:
             self.offline_list_wait_event.set()
         if self.offline_list_release_event is not None:
             self.offline_list_release_event.wait(timeout=2)
         if self.offline_pages is not None:
-            page = max(int(payload), 1)
             page_count = len(self.offline_pages)
-            page_tasks = list(self.offline_pages[page - 1]) if page <= page_count else []
+            tasks = list(self.offline_pages[page - 1]) if 1 <= page <= page_count else []
             total = sum(len(items) for items in self.offline_pages)
-            return {"state": True, "data": {"count": total, "page_count": page_count, "tasks": page_tasks}}
-        return {"state": True, "data": {"count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}}
+        else:
+            page_count = 1
+            tasks = list(self.offline_tasks)
+            total = len(self.offline_tasks)
+        if legacy:
+            return {"state": True, "count": total, "page_count": page_count, "tasks": tasks}
+        return {"state": True, "data": {"count": total, "page_count": page_count, "tasks": tasks}}
 
-    def offline_list(self, payload: dict, type: str = "web") -> dict:
-        self.offline_list_legacy_calls += 1
-        self.offline_list_legacy_payload = payload
-        if self.offline_list_wait_event is not None:
-            self.offline_list_wait_event.set()
-        if self.offline_list_release_event is not None:
-            self.offline_list_release_event.wait(timeout=2)
-        if self.offline_pages is not None:
-            page = max(int(payload.get("page", 1)), 1)
-            page_count = len(self.offline_pages)
-            page_tasks = list(self.offline_pages[page - 1]) if page <= page_count else []
-            total = sum(len(items) for items in self.offline_pages)
-            return {"state": True, "count": total, "page_count": page_count, "tasks": page_tasks}
-        return {"state": True, "count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}
+    def clouddownload_task_list(self, payload: dict, method: str = "GET", type: str = "web") -> dict:
+        return self._fake_offline_page(payload, legacy=True)
 
-    def offline_add_urls(self, payload: dict, method: str = "POST", type: str = "ssp") -> dict:
+    def clouddownload_task_add_urls(self, payload: dict, method: str = "POST", type: str = "ssp") -> dict:
         self.offline_urls_legacy_payload = {**payload, "__type__": type}
         return {"state": True, "data": {"added": True, "payload": payload, "type": type}}
 
-    def offline_remove_open(self, payload: dict) -> dict:
-        if self.fail_offline_remove_open:
-            raise RuntimeError("authorization")
-        self.offline_remove_payload = payload
-        info_hash = payload.get("info_hash", "")
-        self.offline_tasks = [task for task in self.offline_tasks if task.get("info_hash") != info_hash]
-        return {"state": True, "data": {"removed": True}}
-
-    def offline_remove(self, payload: dict, method: str = "POST", type: str = "web") -> dict:
+    def clouddownload_task_del(self, payload: dict, method: str = "POST", type: str = "web") -> dict:
         self.offline_remove_legacy_payload = payload
         hashes = [value for key, value in payload.items() if key.startswith("hash[")]
         self.offline_tasks = [task for task in self.offline_tasks if task.get("info_hash") not in hashes]
         return {"state": True, "data": {"removed": True, "count": 2}}
 
-    def offline_clear_open(self, payload: int = 0) -> dict:
-        self.offline_clear_payload = payload
-        return {"state": True, "data": {"cleared": True, "flag": payload}}
-
-    def offline_quota_info_open(self) -> dict:
-        return {"state": True, "data": {"quota": 5, "used": 1}}
-
-    def offline_sign(self) -> dict:
+    def clouddownload_sign(self) -> dict:
         return {"state": True, "data": {"sign": "sig", "time": 123}}
 
-    def offline_quota_package_array(self) -> dict:
+    def clouddownload_quota_package_array(self) -> dict:
         return {"state": True, "data": [{"package": "basic"}]}
 
-    def offline_quota_package_info(self) -> dict:
+    def clouddownload_quota_package_info(self) -> dict:
         return {"state": True, "data": {"package": "basic", "remaining": 1}}
 
-    def offline_download_path(self) -> dict:
+    def clouddownload_downpath(self) -> dict:
         return {"state": True, "data": [{"file_id": 12, "file_name": "docs"}]}
 
-    def offline_download_path_set(self, payload: int) -> dict:
+    def clouddownload_downpath_set(self, payload: int) -> dict:
         self.offline_download_path_set_payload = payload
         return {"state": True, "data": {"file_id": payload}}
 
-    def offline_restart(self, payload: str) -> dict:
+    def clouddownload_task_restart(self, payload: str) -> dict:
         self.offline_restart_payload = payload
         return {"state": True, "data": {"restarted": payload}}
 
-    def offline_task_count(self, payload: int = 0) -> dict:
+    def clouddownload_task_cnt(self, payload: int = 0) -> dict:
         self.offline_task_count_payload = payload
         return {"state": True, "data": {"count": 2, "flag": payload}}
+
 
     def recyclebin_list(self, payload: dict) -> dict:
         return {"state": True, "data": [{"rid": 1, "name": "trash.txt"}], "offset": payload["offset"], "limit": payload["limit"]}
@@ -421,7 +424,7 @@ class P115ServiceTests(unittest.TestCase):
                     self.cookies = cookies
                     self.app = app
 
-            with patch.dict(os.environ, {"P115_COOKIES": "", "P115_COOKIES_PATH": ""}, clear=False), patch("mcp_115_server.service.P115Client", CapturingClient):
+            with patch.dict(os.environ, {"P115_COOKIES": "", "P115_COOKIES_PATH": ""}, clear=False), patch("p115client.P115Client", CapturingClient):
                 service = P115Service(Settings(P115_COOKIES_PATH=str(cookie_file), P115_COOKIES=None))
                 first = service._get_client_for_platform("web")
                 cookie_file.write_text("UID=new; CID=new; SEID=new; KID=new", encoding="utf-8")
@@ -577,12 +580,26 @@ class P115ServiceTests(unittest.TestCase):
         self.assertEqual(result["source_ids"], [21, 22])
         self.assertEqual(service.client().copy_payload, ([21, 22], 12))
 
-    def test_move_and_copy_entry_use_fs_fallback_calls(self) -> None:
+    def test_move_and_copy_entry_use_web_client_calls(self) -> None:
+        # 单条目的移动/复制走 web 接口（P115FileSystem 的 *_app 会打到 /android/... 而失败）
         service = self.make_service()
         moved = service.move_entry(source_path="/docs/demo.txt", destination_dir_path="/docs")
         copied = service.copy_entry(source_path="/docs/demo.txt", destination_dir_path="/docs")
-        self.assertTrue(moved["moved"])
-        self.assertTrue(copied["copied"])
+        self.assertEqual(moved["source_id"], "21")
+        self.assertEqual(moved["destination_dir_id"], "12")
+        self.assertEqual(service.client().move_payload, (21, 12))
+        self.assertEqual(copied["source_id"], "21")
+        self.assertEqual(service.client().copy_payload, (21, 12))
+
+    def test_rename_and_remove_entry_use_web_client_calls(self) -> None:
+        service = self.make_service()
+        renamed = service.rename_entry(new_name="demo2.txt", remote_path="/docs/demo.txt")
+        self.assertEqual(renamed["id"], "21")
+        self.assertEqual(renamed["name"], "demo2.txt")
+        self.assertEqual(service.client().rename_payload, (21, "demo2.txt"))
+        removed = service.remove_entry(remote_id="21")
+        self.assertEqual(removed["id"], "21")
+        self.assertEqual(service.client().delete_payload, 21)
 
     def test_batch_remove_entries_with_ids(self) -> None:
         service = self.make_service()
@@ -840,7 +857,7 @@ class P115ServiceTests(unittest.TestCase):
     def test_offline_clear_tasks_maps_scope(self) -> None:
         service = self.make_service()
         result = service.offline_clear_tasks("failed")
-        self.assertEqual(service.client().offline_clear_payload, 2)
+        self.assertEqual(service.client().offline_clear_payload["flag"], 2)
         self.assertEqual(result["scope"], "failed")
 
     def test_offline_get_quota_info_returns_payload(self) -> None:
@@ -1014,11 +1031,17 @@ class P115ServiceTests(unittest.TestCase):
             self.assertTrue(Path(out).exists())
 
     def test_finish_qrcode_login_activates_cookies_without_output_path(self) -> None:
-        service = P115Service(Settings(P115_COOKIES="UID=old; CID=old; SEID=old; KID=old"))
-        service._qrcode_sessions["s1"] = {"app": "android", "uid": "u1", "token": {"uid": "u1", "time": 1, "sign": "sig"}, "qrcode_url": "https://qr.example"}
-        with patch.object(P115Client, "login_qrcode_scan_result", return_value={"state": True, "data": {"cookie": "UID=1; CID=2; SEID=3; KID=4"}}):
-            result = service.finish_qrcode_login("s1")
-        self.assertEqual(result["cookies"], "UID=1; CID=2; SEID=3; KID=4")
+        # 不传 output_path 时会写回 P115_COOKIES_PATH，这里必须显式指向临时文件，
+        # 否则会覆盖环境变量指向的真实 cookies 文件。
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cookies_path = Path(temp_dir) / "115-cookies.txt"
+            service = P115Service(Settings(P115_COOKIES_PATH=str(cookies_path)))
+            service._qrcode_sessions["s1"] = {"app": "android", "uid": "u1", "token": {"uid": "u1", "time": 1, "sign": "sig"}, "qrcode_url": "https://qr.example"}
+            with patch.object(P115Client, "login_qrcode_scan_result", return_value={"state": True, "data": {"cookie": "UID=1; CID=2; SEID=3; KID=4"}}):
+                result = service.finish_qrcode_login("s1")
+            self.assertEqual(result["cookies"], "UID=1; CID=2; SEID=3; KID=4")
+            self.assertEqual(result["saved_to"], str(cookies_path))
+            self.assertEqual(cookies_path.read_text(encoding="utf-8"), "UID=1; CID=2; SEID=3; KID=4")
         self.assertIsNotNone(service._client_instance)
 
     def test_get_qrcode_login_status_rejects_unknown_session(self) -> None:

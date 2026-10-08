@@ -59,18 +59,31 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         return bound_service.auth_status(validate_remote=validate_remote)
 
     @mcp.tool
-    def start_qrcode_login(app: str = "alipaymini") -> dict:
-        """Start a 115 QR-code login session and return a URL for scanning."""
+    def start_qrcode_login(app: str = "web") -> dict:
+        """Step 1 of 115 login: start a QR-code session.
+
+        Returns qrcode_url (the payload to scan) and qrcode_image (a PNG data URI
+        that can be shown directly). Then poll get_qrcode_login_status.
+        """
         return bound_service.start_qrcode_login(app=app)
 
     @mcp.tool
-    def get_qrcode_login_status(session_id: str) -> dict:
-        """Check the current status of a previously started QR-code login session."""
-        return bound_service.get_qrcode_login_status(session_id=session_id)
+    def get_qrcode_login_status(session_id: str, timeout: float = 5.0) -> dict:
+        """Step 2 of 115 login: poll the QR session status.
+
+        status_name: waiting / scanned / signed_in / expired / canceled.
+        The backed endpoint long-polls, so this call returns as soon as the
+        status changes and reports "waiting" if it only times out.
+        """
+        return bound_service.get_qrcode_login_status(session_id=session_id, timeout=timeout)
 
     @mcp.tool
     def finish_qrcode_login(session_id: str, output_path: str = "") -> dict:
-        """Finish a signed QR-code login session and optionally save cookies to a file."""
+        """Step 3 of 115 login: exchange the confirmed QR session for cookies.
+
+        Cookies are written to P115_COOKIES_PATH unless output_path is given,
+        and become active for all other tools immediately.
+        """
         return bound_service.finish_qrcode_login(session_id=session_id, output_path=output_path)
 
     @mcp.tool

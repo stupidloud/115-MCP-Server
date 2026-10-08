@@ -14,7 +14,9 @@ authors = [
 ]
 dependencies = [
   "fastmcp>=3.1.1,<4",
-  "p115client>=0.0.8.4.6,<0.1",
+  "p115client>=0.0.9.7.2,<0.1",
+  "qrcode>=7.4",
+  "pillow>=10",
   "pydantic-settings>=2.0,<3",
   "yarl>=1.23,<2",
 ]

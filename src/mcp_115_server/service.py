@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import threading
 import time
@@ -17,6 +19,7 @@ from p115client.fs import P115FileSystem
 from yarl import URL
 
 from .config import Settings
+from .p115_compat import create_client, create_fs, resolve_client_method, resolve_fs_method
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +89,20 @@ _PROGRAMMING_ERRORS = (AttributeError, TypeError, NameError, SyntaxError, Import
 
 def _is_programming_error(exc: Exception) -> bool:
     return isinstance(exc, _PROGRAMMING_ERRORS) or isinstance(getattr(exc, "__cause__", None), _PROGRAMMING_ERRORS)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """判断异常是不是超时（长轮询没等到状态变化时会出现）。"""
+    for current in (exc, exc.__cause__):
+        if current is None:
+            continue
+        name = type(current).__name__.lower()
+        if "timeout" in name:
+            return True
+        text = str(current).lower()
+        if "timed out" in text or "timeout" in text:
+            return True
+    return False
 
 
 class OfflineClearScope(StrEnum):
@@ -319,8 +336,13 @@ class P115Service:
 
         return status
 
-    def start_qrcode_login(self, app: str = "alipaymini") -> dict[str, Any]:
-        selected_app = app.strip() or "alipaymini"
+    def start_qrcode_login(self, app: str = "web") -> dict[str, Any]:
+        """开始一次扫码登录会话，返回可直接渲染的二维码图片。
+
+        流程：start_qrcode_login -> 用户用 115 App 扫码 ->
+        get_qrcode_login_status（轮询）-> finish_qrcode_login（换取并保存 cookies）。
+        """
+        selected_app = app.strip() or "web"
         response = self._call_backend(check_response, P115Client.login_qrcode_token())
         token = response["data"]
         session_id = uuid4().hex
@@ -337,16 +359,64 @@ class P115Service:
                 },
                 "qrcode_url": qrcode_url,
             }
-        return {
+        result: dict[str, Any] = {
             "session_id": session_id,
             "app": selected_app,
             "uid": uid,
             "qrcode_url": qrcode_url,
+            "expires_in": 300,
+            "next_step": "调用 get_qrcode_login_status 轮询，成功后调用 finish_qrcode_login",
         }
+        image = self._qrcode_png_data_uri(qrcode_url)
+        if image:
+            result["qrcode_image"] = image
+        return result
 
-    def get_qrcode_login_status(self, session_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _qrcode_png_data_uri(content: str) -> str:
+        """把二维码内容渲染成 PNG data URI；渲染依赖缺失时返回空串。"""
+        try:
+            import qrcode
+        except ImportError:  # pragma: no cover - 可选依赖
+            return ""
+        try:
+            qr = qrcode.QRCode(border=1)
+            qr.add_data(content)
+            qr.make(fit=True)
+            buffer = io.BytesIO()
+            qr.make_image(fill_color="black", back_color="white").save(buffer, format="PNG")
+        except Exception:  # noqa: BLE001 - 渲染失败不应该让登录失败
+            return ""
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def get_qrcode_login_status(self, session_id: str, timeout: float = 5.0) -> dict[str, Any]:
+        """查询扫码状态。
+
+        ``/get/status/`` 是长轮询接口：没有状态变化时它会挂住连接。
+        这里带一个短超时，超时按「继续等待」处理，避免 MCP 调用被卡住。
+        """
         session = self._get_qrcode_session(session_id)
-        response = self._call_backend(check_response, P115Client.login_qrcode_scan_status(session["token"]))
+        try:
+            response = self._call_backend(
+                check_response,
+                P115Client.login_qrcode_scan_status(
+                    session["token"],
+                    timeout=timeout,
+                    retries=False,  # 否则 urllib3 会重试 3 次，实际耗时变成 4×timeout
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not _is_timeout_error(exc):
+                raise
+            return {
+                "session_id": session_id,
+                "app": session["app"],
+                "uid": session["uid"],
+                "status": 0,
+                "status_name": "waiting",
+                "timed_out": True,
+                "result": None,
+            }
         status = int(response["data"].get("status", 0))
         status_name = {
             0: "waiting",
@@ -365,33 +435,44 @@ class P115Service:
         }
 
     def finish_qrcode_login(self, session_id: str, output_path: str = "") -> dict[str, Any]:
+        """换取 cookies。默认写回 P115_COOKIES_PATH，让后续调用直接可用。"""
         session = self._get_qrcode_session(session_id)
         response = self._call_backend(
             check_response,
             P115Client.login_qrcode_scan_result(session["uid"], app=session["app"]),
         )
         cookies = str(response["data"]["cookie"])
-        saved_to = ""
+
+        destination: Path | None = None
         if output_path.strip():
             destination = Path(output_path).expanduser().resolve()
+        elif self.settings.cookies_path is not None:
+            destination = self.settings.cookies_path
+        saved_to = ""
+        if destination is not None:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(cookies, encoding="utf-8")
             saved_to = str(destination)
-        preferred_platform = session["app"] if session["app"] else None
+
+        # 让后续工具立刻用上新 cookies；用文件路径（Path）传，p115client 才会当成
+        # cookies 文件去读，而不是把路径字符串当作 cookies 解析。
+        cookies_source: str | Path = destination if destination is not None else cookies
+        preferred_platform = session["app"] or None
         self._reset_client_state()
         self._cookie_source_signature = None
-        self._with_client_fallback(
+        logged_in = bool(self._with_client_fallback(
             "activate_qrcode_cookies",
-            lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
+            lambda client, _platform: self._call_backend(client.login_status),
             preferred_platform=preferred_platform,
-            cookies_source=cookies,
-        )
+            cookies_source=cookies_source,
+        ))
         with self._state_lock:
             self._qrcode_sessions.pop(session_id, None)
         return {
             "session_id": session_id,
             "app": session["app"],
             "uid": session["uid"],
+            "logged_in": logged_in,
             "cookies": cookies,
             "saved_to": saved_to,
             "result": self._normalize(response),
@@ -849,7 +930,11 @@ class P115Service:
                 "offline_list_tasks_advanced",
                 lambda client, platform: self._call_backend(
                     check_response,
-                    self._call_backend(client.offline_list, payload, type="web" if self._is_web_like_platform(platform) else "ssp"),
+                    self._call_backend(
+                        resolve_client_method(client, "offline_list"),
+                        payload,
+                        type="web" if self._is_web_like_platform(platform) else "ssp",
+                    ),
                 ),
                 request_id=request_id,
             )
@@ -1260,13 +1345,18 @@ class P115Service:
         destination_dir_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
-        source = self._resolve_remote(remote_id=source_id, remote_path=source_path, allow_root_default=False)
-        destination = self._resolve_remote(
+        source = self._resolve_entry_id(remote_id=source_id, remote_path=source_path, refresh=refresh)
+        destination = self._resolve_dir_id(
             remote_id=destination_dir_id,
             remote_path=destination_dir_path,
-            allow_root_default=True,
+            refresh=refresh,
         )
-        return self._normalize(self._fs_call("move", source, to_dir=destination, refresh=refresh))
+        response = self._client_call("fs_move", source, pid=destination)
+        return {
+            "source_id": str(source),
+            "destination_dir_id": str(destination),
+            "result": self._normalize(response),
+        }
 
     def batch_move_entries(
         self,
@@ -1301,13 +1391,18 @@ class P115Service:
         destination_dir_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
-        source = self._resolve_remote(remote_id=source_id, remote_path=source_path, allow_root_default=False)
-        destination = self._resolve_remote(
+        source = self._resolve_entry_id(remote_id=source_id, remote_path=source_path, refresh=refresh)
+        destination = self._resolve_dir_id(
             remote_id=destination_dir_id,
             remote_path=destination_dir_path,
-            allow_root_default=True,
+            refresh=refresh,
         )
-        return self._normalize(self._fs_call("copy", source, to_dir=destination, refresh=refresh))
+        response = self._client_call("fs_copy", source, pid=destination)
+        return {
+            "source_id": str(source),
+            "destination_dir_id": str(destination),
+            "result": self._normalize(response),
+        }
 
     def batch_copy_entries(
         self,
@@ -1343,8 +1438,15 @@ class P115Service:
     ) -> dict[str, Any]:
         if not new_name.strip():
             raise ToolError("new_name must not be empty.")
-        target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        return self._normalize(self._fs_call("rename", target, name=new_name, refresh=refresh))
+        entry_id = self._resolve_entry_id(remote_id=remote_id, remote_path=remote_path, refresh=refresh)
+        # 注意：P115FileSystem.rename 走的是 proapi /{app}/files/batch_rename（默认 app=android），
+        # 用网页登录的 cookies 会返回「请重新登录」，所以这里直接用 web 接口。
+        response = self._client_call("fs_rename", (entry_id, new_name))
+        return {
+            "id": str(entry_id),
+            "name": new_name,
+            "result": self._normalize(response),
+        }
 
     def remove_entry(
         self,
@@ -1353,8 +1455,12 @@ class P115Service:
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
-        target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        return self._normalize(self._fs_call("remove", target, refresh=refresh))
+        entry_id = self._resolve_entry_id(remote_id=remote_id, remote_path=remote_path, refresh=refresh)
+        response = self._client_call("fs_delete", entry_id)
+        return {
+            "id": str(entry_id),
+            "result": self._normalize(response),
+        }
 
     def batch_remove_entries(
         self,
@@ -1489,10 +1595,9 @@ class P115Service:
             normalized = self._normalize_platform(platform)
             resolved_source = self._ensure_fresh_cookie_source(cookies_source)
             if normalized not in self._client_cache:
-                self._client_cache[normalized] = P115Client(
+                self._client_cache[normalized] = create_client(
                     resolved_source,
-                    check_for_relogin=self.settings.p115_check_for_relogin,
-                    app=normalized,
+                    app=normalized or "",
                     console_qrcode=self.settings.p115_console_qrcode,
                 )
             return self._client_cache[normalized]
@@ -1501,7 +1606,7 @@ class P115Service:
         with self._state_lock:
             normalized = self._normalize_platform(platform)
             if normalized not in self._fs_cache:
-                self._fs_cache[normalized] = P115FileSystem(self._get_client_for_platform(normalized, cookies_source=cookies_source))
+                self._fs_cache[normalized] = create_fs(self._get_client_for_platform(normalized, cookies_source=cookies_source))
             return self._fs_cache[normalized]
 
     def _remember_active_platform(self, platform: str | None, client: P115Client | None = None) -> None:
@@ -1513,7 +1618,7 @@ class P115Service:
             self._client_instance = active_client
             active_fs = self._fs_cache.get(normalized)
             if active_fs is None:
-                active_fs = P115FileSystem(active_client)
+                active_fs = create_fs(active_client)
                 self._fs_cache[normalized] = active_fs
             self._fs_instance = active_fs
 
@@ -1576,7 +1681,7 @@ class P115Service:
                 method_name=method_name,
                 check=check,
             )
-            response = self._call_backend(getattr(client, method_name), *args, **kwargs)
+            response = self._call_backend(resolve_client_method(client, method_name), *args, **kwargs)
             checked = self._call_backend(check_response, response) if check else response
             self._debug_log(
                 "client_call.success",
@@ -1591,7 +1696,7 @@ class P115Service:
     def _fs_call(self, method_name: str, *args, preferred_platform: str | None = None, **kwargs):
         return self._with_fs_fallback(
             method_name,
-            lambda fs, _platform: self._call_backend(getattr(fs, method_name), *args, **kwargs),
+            lambda fs, _platform: self._call_backend(resolve_fs_method(fs, method_name), *args, **kwargs),
             preferred_platform=preferred_platform,
         )
 
@@ -1653,28 +1758,30 @@ class P115Service:
                 )
                 raise
 
+        add_urls = resolve_client_method(client, "offline_add_urls")
+        add_urls_open = resolve_client_method(client, "offline_add_urls_open")
         if self._is_web_like_platform(platform, client):
             try:
-                response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
+                response = attempt_submit("legacy:web", add_urls, legacy_payload, type="web")
                 return self._call_backend(check_response, response)
             except Exception as exc:
                 if _is_programming_error(exc):
                     raise
-                response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
+                response = attempt_submit("legacy:ssp", add_urls, legacy_payload, type="ssp")
                 return self._call_backend(check_response, response)
         try:
-            response = attempt_submit("open", client.offline_add_urls_open, open_payload)
+            response = attempt_submit("open", add_urls_open, open_payload)
             return self._call_backend(check_response, response)
         except Exception as exc:
             if _is_programming_error(exc):
                 raise
             try:
-                response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
+                response = attempt_submit("legacy:ssp", add_urls, legacy_payload, type="ssp")
                 return self._call_backend(check_response, response)
             except Exception as exc:
                 if _is_programming_error(exc):
                     raise
-                response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
+                response = attempt_submit("legacy:web", add_urls, legacy_payload, type="web")
                 return self._call_backend(check_response, response)
 
     def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int, *, request_id: str | None = None):
@@ -1716,36 +1823,40 @@ class P115Service:
                 )
                 raise
 
+        list_tasks = resolve_client_method(client, "offline_list")
+        list_tasks_open = resolve_client_method(client, "offline_list_open")
         if self._is_web_like_platform(platform, client):
-            return attempt_fetch("legacy:web", client.offline_list, {"page": page, "page_size": 1150}, type="web")
+            return attempt_fetch("legacy:web", list_tasks, {"page": page, "page_size": 1150}, type="web")
         try:
-            return attempt_fetch("open", client.offline_list_open, page)
+            return attempt_fetch("open", list_tasks_open, page)
         except Exception as exc:
             if _is_programming_error(exc):
                 raise
-            return attempt_fetch("legacy:ssp", client.offline_list, {"page": page, "page_size": 1150}, type="ssp")
+            return attempt_fetch("legacy:ssp", list_tasks, {"page": page, "page_size": 1150}, type="ssp")
 
     def _offline_remove_task_with_platform(self, client: P115Client, platform: str | None, info_hash: str, delete_source_file: bool):
         payload_open = {"info_hash": info_hash, "del_source_file": int(delete_source_file)}
         payload_legacy = {"hash[0]": info_hash, "flag": int(delete_source_file)}
+        remove_task = resolve_client_method(client, "offline_remove")
+        remove_task_open = resolve_client_method(client, "offline_remove_open")
         if self._is_web_like_platform(platform, client):
             try:
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
+                return self._call_backend(check_response, self._call_backend(remove_task, payload_legacy, type="web"))
             except Exception as exc:
                 if _is_programming_error(exc):
                     raise
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
+                return self._call_backend(check_response, self._call_backend(remove_task, payload_legacy, type="ssp"))
         try:
-            return self._call_backend(check_response, self._call_backend(client.offline_remove_open, payload_open))
+            return self._call_backend(check_response, self._call_backend(remove_task_open, payload_open))
         except Exception as exc:
             if _is_programming_error(exc):
                 raise
             try:
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
+                return self._call_backend(check_response, self._call_backend(remove_task, payload_legacy, type="ssp"))
             except Exception as exc:
                 if _is_programming_error(exc):
                     raise
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
+                return self._call_backend(check_response, self._call_backend(remove_task, payload_legacy, type="web"))
 
     def _list_all_offline_tasks(self, status: str = "") -> list[dict[str, Any]]:
         snapshot = self._list_all_offline_tasks_cached(status=status)
@@ -1910,6 +2021,36 @@ class P115Service:
                 return self._qrcode_sessions[normalized_id]
             except KeyError as exc:
                 raise ToolError(f"Unknown qrcode login session: {normalized_id}") from exc
+
+    def _resolve_entry_id(
+        self,
+        *,
+        remote_id: str | int | None,
+        remote_path: str | None,
+        refresh: bool = False,
+    ) -> int:
+        """把 id 或路径解析成一个具体条目的 id。"""
+        target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
+        if isinstance(target, int):
+            return target
+        metadata = self._fs_call("get_attr", target, refresh=refresh)
+        return self._parse_remote_id(str(metadata["id"]), "remote_id")
+
+    def _resolve_dir_id(
+        self,
+        *,
+        remote_id: str | int | None,
+        remote_path: str | None,
+        refresh: bool = False,
+    ) -> int:
+        """把 id 或路径解析成目录 id，并确认它确实是目录。"""
+        target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=True)
+        if target == "":
+            return 0
+        metadata = self._fs_call("get_attr", target, refresh=refresh)
+        if not metadata["is_dir"]:
+            raise ToolError("Destination must be a directory.")
+        return self._parse_remote_id(str(metadata["id"]), "destination_dir_id")
 
     @staticmethod
     def _resolve_remote(

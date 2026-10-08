@@ -14,6 +14,59 @@
 
 同时也感谢 **FastMCP** 提供了稳定、清晰的 MCP 服务构建能力，使这些 115 功能可以以 MCP 工具的形式对外提供。
 
+## 本 fork 的改动（兼容新版 p115client + 登录支持）
+
+> 上游代码是照着**并不存在的 p115client 接口**写的：`offline_*` / `offline_*_open`
+> 这些方法名、以及 `P115Client(check_for_relogin=...)` 这个参数，在 PyPI 上**任何**
+> p115client 版本里都不存在（PyPI 最早的版本是 0.0.9，方法名是 `clouddownload_*`）。
+> 也就是说上游仓库按默认依赖装完，启动能成功、工具能列出，但**任何工具一调用就报错**。
+> 本 fork 把它改到能真正跑起来。
+
+### 1. 新增兼容层 `src/mcp_115_server/p115_compat.py`
+
+- `create_client()`：按运行时签名过滤参数，去掉已删除的 `check_for_relogin`。
+- `resolve_client_method()`：把历史名字映射到真实接口。
+  - 只改名的（`offline_list` → `clouddownload_task_list`、`offline_remove` →
+    `clouddownload_task_del`、`offline_sign` → `clouddownload_sign`、
+    `offline_task_count` → `clouddownload_task_cnt`、`offline_download_path` →
+    `clouddownload_downpath` 等）直接转发；
+  - 原来的 `*_open` 名字对应开放平台接口，p115client 新版没有等价方法，
+    改为直接请求 `proapi.115.com/open/offline/*`。
+- `create_fs()`：绕开 p115client **0.0.9.7 的一个回归**。该版本把
+  `id_to_attr` / `_pid_name_to_attr` 换成了 `WeakValueDictionary`，但写入的是普通
+  `dict`（不支持弱引用），于是「按 id 查元数据」会抛
+  `TypeError: cannot create weak reference to 'dict' object`。这里把这两个缓存换回普通 `dict`。
+
+### 2. 单条目的改/移/拷/删改走 web 接口
+
+`P115FileSystem` 的 `rename` / `move` / `copy` / `remove` 内部调用的是
+`proapi.115.com/{app}/files/...`（默认 `app="android"`）。用**网页扫码登录**的 cookies
+调用会返回 `{"error": "请重新登录", "errno": 99}`。因此 `rename_entry` /
+`move_entry` / `copy_entry` / `remove_entry` 改为使用 `webapi.115.com` 的
+`fs_rename` / `fs_move` / `fs_copy` / `fs_delete`（与仓库里原本就能用的
+`batch_*` 接口保持一致）。
+
+### 3. 登录支持增强
+
+三个登录工具（`start_qrcode_login` / `get_qrcode_login_status` / `finish_qrcode_login`）现在：
+
+- `start_qrcode_login` 除了 `qrcode_url`，还返回 **`qrcode_image`**（PNG data URI），
+  MCP 客户端可以直接把二维码显示给用户扫；默认设备从 `alipaymini` 改为 `web`。
+- `get_qrcode_login_status` 增加 `timeout` 参数（默认 5 秒）。`/get/status/` 是
+  **长轮询**接口，没有状态变化时会挂住连接；这里带超时并按「继续等待」处理，
+  同时关闭 urllib3 的自动重试（否则实际耗时是 timeout 的 4 倍）。
+- `finish_qrcode_login` 默认把 cookies **写回 `P115_COOKIES_PATH`**（可用
+  `output_path` 覆盖），并立即生效，后续工具无需重启即可使用。
+
+### 4. 依赖与测试
+
+- `pyproject.toml`：`p115client>=0.0.9.7.2,<0.1`，新增 `qrcode`、`pillow`。
+- 测试用的假客户端同步改成真实方法名，并新增 `tests/test_p115_compat.py`；
+  另外修掉一个会**覆盖真实 cookies 文件**的测试（`finish_qrcode_login` 不传
+  `output_path` 时会写回 `P115_COOKIES_PATH`）。
+- 新增两个联网冒烟脚本：`scripts/smoke_live.py`（服务层）与 `scripts/smoke_mcp.py`
+  （走 stdio 的真实 MCP 调用）。
+
 ## 快速开始
 
 如果你想最快跑起来，可以按这个顺序：
