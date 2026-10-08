@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import logging
 import threading
@@ -1602,9 +1603,12 @@ class P115Service:
             path = Path(cookies_source)
             try:
                 st = path.stat()
-                return ("path", str(path.resolve()), st.st_mtime, st.st_size)
+                # 只看 mtime+size 会漏掉「大小不变、时间戳落在同一刻度内」的修改，
+                # 那样就不会重建客户端，一直用着旧 cookies。tiny 文件直接算摘要。
+                digest = hashlib.sha1(path.read_bytes()).hexdigest()
             except OSError:
                 return ("path", str(path.resolve()), None, None)
+            return ("path", str(path.resolve()), st.st_mtime, st.st_size, digest)
         return ("inline", str(cookies_source))
 
     def _reset_client_state(self) -> None:

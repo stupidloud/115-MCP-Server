@@ -78,20 +78,19 @@
 
 ## 快速开始
 
-如果你想最快跑起来，可以按这个顺序：
+如果想最快跑起来，按这个顺序：
 
-1. 创建虚拟环境
-2. 安装依赖
+1. 安装 [uv](https://docs.astral.sh/uv/)（一次性，见下面的「安装 uv」）
+2. 同步依赖：`uv sync`
 3. 配置 `P115_COOKIES` 或 `P115_COOKIES_PATH`
-4. 启动 MCP 服务
+4. 启动 MCP 服务：`uv run 115-MCP-Server`
 5. 在 MCP 客户端里接入
 
 最简命令：
 
 ```bash
-python -m venv .venv
-./.venv/Scripts/python -m pip install -e .
-./.venv/Scripts/115-MCP-Server
+uv sync
+uv run 115-MCP-Server
 ```
 
 ## 功能
@@ -123,38 +122,61 @@ python -m venv .venv
 
 ### 环境要求
 
-- Python 3.12 或更高版本
+- [uv](https://docs.astral.sh/uv/)：用来创建虚拟环境、安装依赖
+- Python 3.12 或更高版本（uv 会自己下载合适版本，不需要你手动装）
 - Windows 环境已验证可用
 - 需要能访问 115 相关接口
 
-### 方式一：源码安装（推荐）
+### 安装 uv（一次性）
 
-```bash
-python -m venv .venv
-./.venv/Scripts/python -m pip install --upgrade pip
-./.venv/Scripts/python -m pip install -e .
+```powershell
+# Windows
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-安装完成后，可执行入口包括：
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-- `./.venv/Scripts/115-MCP-Server`
-- `python -m mcp_115_server`（内部模块入口）
+也可以用 `pip install uv`，或通过 winget / Scoop / Homebrew 安装。
 
-### 方式二：开发模式重新安装
+### 安装依赖（推荐）
 
-如果你修改了源码并希望重新安装当前项目：
+在项目根目录执行：
 
 ```bash
-./.venv/Scripts/python -m pip install -e .
+uv sync
 ```
+
+它会自动完成：
+
+- 创建 `.venv`
+- 按 `uv.lock` 安装**锁定版本**的依赖（含 p115client）
+- 以可编辑模式安装本项目，生成 `115-MCP-Server` 入口
+
+> 仓库里已经带了 `uv.lock`。p115client 在 0.0.9.x 期间接口改动很频繁，
+> 锁版本可以避免「装到不兼容的新版本」这类问题。
+
+### 不想用锁文件的话
+
+```bash
+uv venv
+uv pip install -e .
+```
+
+### 改了代码要重新安装吗
+
+不用。`uv sync` 是**可编辑安装**，改源码立即生效；只有改了 `pyproject.toml`
+里的依赖时才需要再跑一次 `uv sync`。
 
 ### 验证安装是否成功
 
 ```bash
-./.venv/Scripts/115-MCP-Server --help
+uv run 115-MCP-Server --help
 ```
 
-如果能看到命令行帮助，说明安装成功。
+能看到命令行帮助，就说明安装成功。
 
 ## 配置
 
@@ -224,7 +246,17 @@ FASTMCP_TRANSPORT=stdio
 适用于绝大多数 MCP 桌面客户端。
 
 ```bash
-./.venv/Scripts/115-MCP-Server
+uv run 115-MCP-Server
+```
+
+如果已经在虚拟环境里、不想让 uv 再做一次同步检查，也可以直接运行入口：
+
+```bash
+# Windows
+.\.venv\Scripts\115-MCP-Server.exe
+
+# macOS / Linux
+./.venv/bin/115-MCP-Server
 ```
 
 ### HTTP
@@ -232,13 +264,7 @@ FASTMCP_TRANSPORT=stdio
 适用于需要通过 URL 接入 MCP 的客户端或调试场景。
 
 ```bash
-./.venv/Scripts/115-MCP-Server --transport http --host 127.0.0.1 --port 8000 --path /mcp
-```
-
-也可以使用安装后的命令：
-
-```bash
-115-MCP-Server
+uv run 115-MCP-Server --transport http --host 127.0.0.1 --port 8000 --path /mcp
 ```
 
 Windows 也可以直接运行脚本：
@@ -266,24 +292,24 @@ scripts\run-http.cmd
 例如：
 
 ```bash
-./.venv/Scripts/115-MCP-Server --transport http --host 127.0.0.1 --port 8010 --path /mcp --log-level debug
+uv run 115-MCP-Server --transport http --host 127.0.0.1 --port 8010 --path /mcp --log-level debug
 ```
 
 ## MCP 客户端接入示例
 
 在开始之前，先准备这几个信息：
 
-- Python 可执行文件：`C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- 备用模块入口：`python -m mcp_115_server`
+- 项目根目录：就是有 `pyproject.toml` 的那一层，例如 `C:/Users/your-name/115-MCP-Server`
+- 启动方式：`uv run --directory <项目根目录> 115-MCP-Server`
 - 推荐环境变量：
 
 ```text
-P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
+P115_COOKIES_PATH=C:/Users/your-name/115-cookies.txt
 P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
 ```
 
-### 通用 stdio 模板
+### 通用 stdio 模板（uv，推荐）
 
 如果某个客户端支持以 `command + args + env` 的方式添加 MCP 服务，可直接套用：
 
@@ -291,16 +317,55 @@ P115_CONSOLE_QRCODE=false
 {
   "mcpServers": {
     "115-MCP-Server": {
-      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "mcp_115_server"],
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "C:/Users/your-name/115-MCP-Server",
+        "115-MCP-Server"
+      ],
       "env": {
-        "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt",
-        "P115_CHECK_FOR_RELOGIN": "true",
+        "P115_COOKIES_PATH": "C:/Users/your-name/115-cookies.txt",
         "P115_ALLOW_QRCODE_LOGIN": "false",
         "P115_CONSOLE_QRCODE": "false"
       }
     }
   }
+}
+```
+
+几个注意点：
+
+- `command` 建议写 `uv` 可执行文件的**绝对路径**（例如 `C:/Users/your-name/.local/bin/uv.exe`），
+  因为部分 MCP 客户端不会继承系统的 `PATH`
+- `--directory` 必须指向项目根目录
+- 路径统一用正斜杠 `/`，省掉 JSON 里的反斜杠转义
+- 首次启动时 uv 会自动 `sync` 一次依赖，可能多花几秒
+
+### 备选：直接用虚拟环境里的入口
+
+不想让客户端依赖 `uv` 时，可以先 `uv sync`，再把入口写死：
+
+```json
+{
+  "mcpServers": {
+    "115-MCP-Server": {
+      "command": "C:\\Users\\your-name\\115-MCP-Server\\.venv\\Scripts\\115-MCP-Server.exe",
+      "args": [],
+      "env": {
+        "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt"
+      }
+    }
+  }
+}
+```
+
+或者用模块入口：
+
+```json
+{
+  "command": "C:\\Users\\your-name\\115-MCP-Server\\.venv\\Scripts\\python.exe",
+  "args": ["-m", "mcp_115_server"]
 }
 ```
 
@@ -317,8 +382,8 @@ P115_CONSOLE_QRCODE=false
 
 先启动服务：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run-http.ps1
+```bash
+uv run 115-MCP-Server --transport http --host 127.0.0.1 --port 8000 --path /mcp
 ```
 
 默认地址：
@@ -335,8 +400,8 @@ http://127.0.0.1:8000/mcp
 
 1. 客户端版本是否真的支持 MCP
 2. 是否选择了 `stdio` 或 HTTP MCP 模式
-3. Python 路径是否正确
-4. 是否使用了正确的 `python.exe` 与 `-m mcp_115_server` 入口
+3. `uv` 是否在 PATH 里（客户端启动的进程可能没有继承你的 PATH，建议写绝对路径）
+4. `--directory` 是否指向项目根目录，且该目录下能跑通 `uv run 115-MCP-Server --help`
 5. cookies 是否已正确配置
 6. HTTP 模式下端口和路径是否为 `127.0.0.1:8000/mcp`
 
@@ -386,17 +451,25 @@ http://127.0.0.1:8000/mcp
 ## 项目结构
 
 ```text
+pyproject.toml        # 项目定义与依赖
+uv.lock               # 锁定的依赖版本（uv sync 使用）
 src/mcp_115_server/
-  config.py      # 环境变量与服务配置
-  service.py     # 115 业务封装层
-  server.py      # FastMCP 工具注册与服务入口
+  config.py           # 环境变量与服务配置
+  service.py          # 115 业务封装层
+  server.py           # FastMCP 工具注册与服务入口
+  p115_compat.py      # p115client 版本兼容层（本 fork 新增）
 tests/
   test_service.py
+  test_p115_compat.py
+  test_qrcode_ascii.py
 scripts/
+  smoke_live.py       # 服务层联网冒烟测试
+  smoke_mcp.py        # 通过 stdio 的真实 MCP 端到端测试
   run-stdio.ps1
   run-http.ps1
   run-stdio.cmd
   run-http.cmd
+  build-exe.ps1
 ```
 
 ## MCP 工具
@@ -722,7 +795,13 @@ scripts/
 ## 测试
 
 ```bash
-./.venv/Scripts/python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
+```
+
+如果习惯 pytest，可以用 uv 临时把 pytest 拉进来跑，不污染项目依赖：
+
+```bash
+uv run --with pytest pytest tests -q
 ```
 
 ## 本地打包为 Windows exe
@@ -730,9 +809,12 @@ scripts/
 如果你需要在本地构建 Windows 可执行文件：
 
 ```powershell
-./.venv/Scripts/python -m pip install pyinstaller
+uv pip install pyinstaller
 powershell -ExecutionPolicy Bypass -File .\scripts\build-exe.ps1
 ```
+
+> `uv pip install pyinstaller` 只是临时装进当前的 `.venv`，下次 `uv sync` 会把它清掉
+> （想保留可以加 `--inexact`）。
 
 构建完成后输出位于：
 
@@ -766,9 +848,11 @@ dist\115-MCP-Server.exe
 
 检查：
 
-- Python 路径是否正确
-- 虚拟环境是否已安装 `pip install -e .`
-- 客户端配置里的 `args` 是否为 `-m mcp_115_server`
+- 项目根目录下能否直接跑通 `uv run 115-MCP-Server --help`
+- 客户端配置里的 `command` 是否写成了 `uv` 的绝对路径（客户端往往没有继承系统 `PATH`）
+- `--directory` 是否指向项目根目录
+- 如果没用 uv 启动，`command` 是否指向 `.venv` 里真实的 `115-MCP-Server.exe`；
+  用模块入口时 `args` 是否为 `["-m", "mcp_115_server"]`
 
 ### 4. HTTP 模式无法访问
 
