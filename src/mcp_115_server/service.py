@@ -369,7 +369,42 @@ class P115Service:
         image = self._qrcode_png_data_uri(qrcode_url)
         if image:
             result["qrcode_image"] = image
+        ascii_art = self._qrcode_ascii(qrcode_url)
+        if ascii_art:
+            result["qrcode_ascii"] = ascii_art
         return result
+
+    @staticmethod
+    def _qrcode_ascii(content: str) -> str:
+        """把二维码渲染成纯文本，供无法显示图片的 MCP 客户端直接打印。
+
+        用半块字符（▀ ▄ █）把 2 行模块压成 1 个字符行，宽高比在等宽字体下接近正方。
+        留 2 个模块的静默区（quiet zone），否则部分扫码器识别不了。
+        """
+        if not content.strip():
+            return ""
+        try:
+            import qrcode
+        except ImportError:  # pragma: no cover - 可选依赖
+            return ""
+        try:
+            qr = qrcode.QRCode(border=2)
+            qr.add_data(content)
+            qr.make(fit=True)
+            matrix = qr.get_matrix()
+        except Exception:  # noqa: BLE001 - 渲染失败不应该让登录失败
+            return ""
+
+        blank = [False] * len(matrix[0])
+        lines: list[str] = []
+        for row in range(0, len(matrix), 2):
+            top = matrix[row]
+            bottom = matrix[row + 1] if row + 1 < len(matrix) else blank
+            lines.append("".join(
+                "█" if t and b else "▀" if t else "▄" if b else " "
+                for t, b in zip(top, bottom)
+            ))
+        return "\n".join(lines)
 
     @staticmethod
     def _qrcode_png_data_uri(content: str) -> str:

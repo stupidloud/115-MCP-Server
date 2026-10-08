@@ -50,8 +50,14 @@
 
 三个登录工具（`start_qrcode_login` / `get_qrcode_login_status` / `finish_qrcode_login`）现在：
 
-- `start_qrcode_login` 除了 `qrcode_url`，还返回 **`qrcode_image`**（PNG data URI），
-  MCP 客户端可以直接把二维码显示给用户扫；默认设备从 `alipaymini` 改为 `web`。
+- `start_qrcode_login` 除了 `qrcode_url`，还返回两种可直接展示的二维码：
+  - **`qrcode_image`**：PNG data URI，能给客户端渲染图片；
+  - **`qrcode_ascii`**：**纯文本**二维码（用 `▀ ▄ █` 半块字符，2 个模块行压成 1 个字符行），
+    在等宽字体下原样打印即可，适合不能显示图片的 MCP 客户端。
+
+  实测：把 `qrcode_ascii` 还原成位图后用 zxing-cpp 解码，能正确读出原始的扫码 URL。
+
+  默认设备从 `alipaymini` 改为 `web`。
 - `get_qrcode_login_status` 增加 `timeout` 参数（默认 5 秒）。`/get/status/` 是
   **长轮询**接口，没有状态变化时会挂住连接；这里带超时并按「继续等待」处理，
   同时关闭 urllib3 的自动重试（否则实际耗时是 timeout 的 4 倍）。

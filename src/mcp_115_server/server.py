@@ -62,8 +62,14 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     def start_qrcode_login(app: str = "web") -> dict:
         """Step 1 of 115 login: start a QR-code session.
 
-        Returns qrcode_url (the payload to scan) and qrcode_image (a PNG data URI
-        that can be shown directly). Then poll get_qrcode_login_status.
+        Returns:
+          - qrcode_url: the payload to scan
+          - qrcode_image: a PNG data URI (for clients that can render images)
+          - qrcode_ascii: a plain-text rendering of the same QR code (half-block
+            characters); print it verbatim in a monospace font for clients that
+            cannot show images.
+
+        Then poll get_qrcode_login_status until status_name is signed_in.
         """
         return bound_service.start_qrcode_login(app=app)
 
