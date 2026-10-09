@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import platform
 from base64 import b64decode, b64encode
 from hashlib import sha1
 from time import time
@@ -31,6 +32,9 @@ WEB_LOGIN_REJECTED = (
     "web 方式会把你自己浏览器端的登录顶掉，而且 web 不是一台「设备」。"
     '请改用设备 app（例如 app="android"）。'
 )
+
+# 登录成功后自动信任该设备时，在 115 的设备列表里显示的名字。
+TRUSTED_DEVICE_NAME = "115-MCP-Server"
 
 # 由账号名推导 device_id 用的固定命名空间（UUIDv5）。
 # 这个值是**接口的一部分**：一旦改了，同一个账号会被 115 当成另一台新设备。
@@ -107,6 +111,30 @@ def submit_login_sms_code(*, account: str, code: str, app: str = DEFAULT_LOGIN_A
         {"account": account, "code": code},
         app=normalize_app(app),
     )
+
+
+def trust_device(
+    client: P115Client,
+    device_id: str,
+    *,
+    device_name: str = "",
+    os_ver: str = "",
+    app: str = DEFAULT_LOGIN_APP,
+) -> dict[str, Any]:
+    """两步验证：信任某设备（需要带登录会话 cookies 的客户端）。
+
+    信任之后，用同一个 ``device_id`` 登录不会再被要求短信验证码。
+    这里只做设备信任，不做设备的查询或移除。
+    """
+    return client.login_two_step_trust_device_trust(
+        {
+            "device_id": device_id,
+            "device_name": device_name or TRUSTED_DEVICE_NAME,
+            "os_ver": os_ver or f"{platform.system()} {platform.release()}",
+        },
+        app=normalize_app(app),
+    )
+
 
 
 def needs_captcha(response: dict[str, Any]) -> bool:

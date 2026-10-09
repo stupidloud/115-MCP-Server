@@ -581,6 +581,9 @@ class P115Service:
         ``device_id`` 默认由账号名按固定算法推出（同一个账号永远是同一台设备，
         见 ``p115_login.derive_device_id``）；显式传 ``device_id`` 可以改用别的设备。
 
+        **登录成功后会自动把这台设备加入两步验证信任列表**（返回里的 ``trusted_device``），
+        所以同一台设备之后登录不再需要短信验证码。
+
         可能返回三个阶段：
 
         - ``stage="done"``：登录成功，cookies 已写回 ``P115_COOKIES_PATH``
@@ -609,7 +612,11 @@ class P115Service:
         error = response.get("error") or response.get("message")
         cookies = self._extract_login_cookies(response)
         if cookies is not None:
-            return {"stage": "done", **self._persist_login_cookies(cookies, app=app), "result": self._normalize(response)}
+            return {
+                "stage": "done",
+                **self._finish_login(cookies, app=app, device_id=device_id),
+                "result": self._normalize(response),
+            }
 
         if errno == p115_login.ERRNO_TWO_STEP:
             user_id = (response.get("data") or {}).get("user_id")
@@ -643,16 +650,19 @@ class P115Service:
         code: str,
         *,
         app: str = p115_login.DEFAULT_LOGIN_APP,
+        device_id: str = "",
     ) -> dict[str, Any]:
-        """两步验证：提交短信验证码，成功后同样会写回 cookies。
+        """两步验证：提交短信验证码，成功后同样会写回 cookies 并信任该设备。
 
-        ``app`` 要和上一步 ``login_with_password`` 用的一致，否则拿到的会是另一台设备的会话。
+        ``app`` 和 ``device_id`` 要和上一步 ``login_with_password`` 用的一致，
+        否则信任的会是另一台设备。
         """
         app = self._resolve_login_app(app)
         if not account.strip():
             raise ToolError("account must not be empty.")
         if not code.strip():
             raise ToolError("code must not be empty.")
+        device_id = device_id.strip() or p115_login.derive_device_id(account)
         response = self._call_backend(
             p115_login.submit_login_sms_code,
             account=account.strip(),
@@ -661,12 +671,51 @@ class P115Service:
         )
         cookies = self._extract_login_cookies(response)
         if cookies is not None:
-            return {"stage": "done", **self._persist_login_cookies(cookies, app=app), "result": self._normalize(response)}
+            return {
+                "stage": "done",
+                **self._finish_login(cookies, app=app, device_id=device_id),
+                "result": self._normalize(response),
+            }
         return {
             "ok": False,
             "stage": "error",
             "errno": response.get("errno"),
             "error": response.get("error") or response.get("message"),
+        }
+
+    def _finish_login(self, cookies: Any, *, app: str, device_id: str) -> dict[str, Any]:
+        """登录成功后的收尾：写回 cookies，并把这台设备加入两步验证信任列表。
+
+        信任之后，同一台设备下次登录就不再需要短信验证码。
+        """
+        saved = self._persist_login_cookies(cookies, app=app)
+        return {
+            **saved,
+            "device_id": device_id,
+            "trusted_device": (
+                self._trust_login_device(device_id, app=app) if saved["logged_in"] else {}
+            ),
+        }
+
+    def _trust_login_device(self, device_id: str, *, app: str) -> dict[str, Any]:
+        """把登录用的设备加入两步验证信任列表；失败不影响登录本身。
+
+        信任接口需要刚登录拿到的会话（cookies），所以走带 cookies 的客户端。
+        """
+        try:
+            response = self._with_client_fallback(
+                "trust_login_device",
+                lambda client, _platform: self._call_backend(
+                    p115_login.trust_device, client, device_id, app=app
+                ),
+                preferred_platform=app,
+            )
+        except ToolError as exc:
+            return {"ok": False, "device_id": device_id, "error": str(exc)}
+        return {
+            "ok": bool(response.get("state")),
+            "device_id": device_id,
+            "error": response.get("error") or response.get("message") or "",
         }
 
     @staticmethod

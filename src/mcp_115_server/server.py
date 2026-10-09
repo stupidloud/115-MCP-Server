@@ -110,7 +110,10 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         device_id is optional: by default it is derived from the account name by
         a fixed algorithm, so one account always logs in as the same device. A
         device that is not in the trust list yet triggers the two-step SMS code;
-        add it to the trust list in the 115 app to skip that.
+        the first successful login trusts it, so that happens at most once.
+
+        On success the device is also added to the two-step-verification trust
+        list, so later logins from this device skip the SMS code.
 
         Returns one of three stages:
           - "done": logged in; cookies were saved to P115_COOKIES_PATH and are
@@ -144,13 +147,19 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         return bound_service.get_login_captcha()
 
     @mcp.tool
-    def submit_login_sms(account: str, code: str, app: str = DEFAULT_LOGIN_APP) -> dict:
+    def submit_login_sms(
+        account: str,
+        code: str,
+        app: str = DEFAULT_LOGIN_APP,
+        device_id: str = "",
+    ) -> dict:
         """Finish a two-step-verification login with the SMS code.
 
         account is the same account/phone used in login_with_password; code is
-        the SMS code just received.
+        the SMS code just received. Pass the same app/device_id as in
+        login_with_password so the right device gets trusted.
         """
-        return bound_service.submit_login_sms(account, code, app=app)
+        return bound_service.submit_login_sms(account, code, app=app, device_id=device_id)
 
     @mcp.tool
     def list_directory(
